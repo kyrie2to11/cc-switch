@@ -20,7 +20,6 @@ mod init_status;
 mod lightweight;
 #[cfg(target_os = "linux")]
 mod linux_fix;
-mod window_state_guard;
 mod mcp;
 mod model_capabilities;
 mod openclaw_config;
@@ -35,6 +34,7 @@ mod services;
 mod session_manager;
 mod settings;
 mod store;
+mod window_state_guard;
 
 mod tray;
 mod usage_events;
