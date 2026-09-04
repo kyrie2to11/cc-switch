@@ -164,9 +164,7 @@ fn rewrite_entries_logical(path: &Path, scale: f64, max_w: u64, max_h: u64) {
             .unwrap_or(false)
         {
             let _ = std::fs::rename(&tmp, path);
-            log::info!(
-                "窗口状态已按显示器 scale={scale} 归一化为逻辑像素(上限 {max_w}x{max_h})"
-            );
+            log::info!("窗口状态已按显示器 scale={scale} 归一化为逻辑像素(上限 {max_w}x{max_h})");
         }
     }
 }
@@ -190,7 +188,9 @@ pub fn reapply_saved_size(window: &WebviewWindow) {
         if window.is_maximized().unwrap_or(false) || window.is_fullscreen().unwrap_or(false) {
             return;
         }
-        let Some(path) = state_file_path() else { return };
+        let Some(path) = state_file_path() else {
+            return;
+        };
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
             Err(_) => return,
