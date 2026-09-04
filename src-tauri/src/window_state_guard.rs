@@ -9,11 +9,11 @@
 //! 巨型 WebView 视口拖影」,且退出时保存的仍是坏值,开机自启动每天复现。
 //!
 //! 本模块不修 tao(上游问题),只在 cc-switch 侧的收口点钳制:
-//! 1. [`startup_sanitize`]:进程启动、插件读取状态文件之前,把超出静态上限
+//! 1. `startup_sanitize`:进程启动、插件读取状态文件之前,把超出静态上限
 //!    (8K)或低于合理下限的窗口条目重置(删除条目,插件按默认尺寸创建)。
-//! 2. [`clamp_state_file_to_monitors`]:配合 `save_window_state_before_exit`,
+//! 2. `clamp_state_file_to_monitors`:配合 `save_window_state_before_exit`,
 //!    在落盘后按当前显示器的最大物理尺寸钳制文件内容,保证坏值无法持久化。
-//! 3. [`reconcile_window_to_monitor`]:窗口显示路径上,若 `inner_size` 超出
+//! 3. `reconcile_window_to_monitor`:窗口显示路径上,若 `inner_size` 超出
 //!    所在显示器尺寸,立即修正(兜底同一会话内的异常,如运行中拔掉显示器)。
 
 use serde_json::Value;
