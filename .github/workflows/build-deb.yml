@@ -1,0 +1,70 @@
+name: Build Linux deb (fix branch)
+
+# fix/** 分支的 CI 构建:产出可安装的 .deb(workflow_dispatch 手动触发或 push 自动触发)。
+# 与 release.yml 的区别:不走 tag、不做更新器签名(fork 无 TAURI_SIGNING_PRIVATE_KEY,
+# 通过 --config 关闭 createUpdaterArtifacts),先跑与 ci.yml 相同的 fmt/clippy/test。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'fix/**'
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            || sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.0-dev
+          sudo apt-get install -y --no-install-recommends libsoup-3.0-dev \
+            || sudo apt-get install -y --no-install-recommends libsoup2.4-dev
+
+      - name: Setup pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Create frontend dist placeholder
+        run: mkdir -p dist
+
+      - name: Check Rust formatting
+        run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build deb
+        run: pnpm tauri build --bundles deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
