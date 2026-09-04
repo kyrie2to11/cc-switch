@@ -2263,9 +2263,9 @@ pub fn save_window_state_before_exit(app_handle: &tauri::AppHandle) {
         log::info!("已在退出前保存窗口状态");
     }
     // tao GTK 后端在混合缩放/登录竞态下 inner_size() 可能返回膨胀值
-    // (物理/逻辑像素混淆),落盘后按实际显示器尺寸再钳制一次,
-    // 防止坏值在每次开机恢复时把窗口变成"假最大化"。
-    window_state_guard::clamp_state_file_to_monitors(app_handle);
+    // (物理/逻辑像素混淆),落盘后按窗口所在显示器的 scale 归一化为逻辑像素,
+    // 防止坏值在每次开机恢复时把窗口越变越大(配合 reapply_saved_size)。
+    window_state_guard::normalize_saved_state_to_logical(app_handle);
 }
 
 /// 主动释放 single-instance 锁。

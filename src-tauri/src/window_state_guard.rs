@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, WebviewWindow};
+use tauri::{AppHandle, Manager, WebviewWindow};
 
 const STATE_FILENAME: &str = ".window-state.json";
 // 与 tauri.conf.json 的 identifier 保持一致;此处无法通过 AppHandle 获取,
@@ -91,27 +91,132 @@ fn sanitize_file(path: &Path, max_w: u64, max_h: u64) {
     }
 }
 
-/// 在 `save_window_state` 落盘之后调用:按当前所有显示器的最大物理尺寸
-/// (各轴独立取最大,允许窗口横跨到最大屏的尺寸)再次钳制,确保坏值不落盘。
-/// 显示器查询失败时退化为静态 8K 上限。
-pub fn clamp_state_file_to_monitors(app: &AppHandle) {
-    let (mut max_w, mut max_h) = (HARD_MAX_W, HARD_MAX_H);
-    if let Ok(monitors) = app.available_monitors() {
-        let mut mw = 0;
-        let mut mh = 0;
-        for m in &monitors {
-            let s = m.size();
-            mw = mw.max(s.width as u64);
-            mh = mh.max(s.height as u64);
-        }
-        if mw > 0 && mh > 0 {
-            max_w = max_w.min(mw);
-            max_h = max_h.min(mh);
-        }
-    }
+/// 在 `save_window_state` 落盘之后调用。
+///
+/// 插件保存的是物理像素,而 tao 的 scale 缓存在混合缩放多屏下保存/恢复两个
+/// 时刻读数可能不一致(窗口在 scale=1 的屏、缓存读到 1.3333),实测每循环
+/// 膨胀 ×1.3333。这里把主窗口的条目换算成「逻辑像素」存盘(用窗口真实所在
+/// 显示器的 scale),配合 [`reapply_saved_size`] 在 scale 稳定后按逻辑像素
+/// 重新应用,构成不动点:存什么恢复什么,不再漂移。
+///
+/// 查不到主窗口/显示器时(如轻量模式退出时窗口已销毁),退化为按所有显示器
+/// 的最大物理尺寸做越界清理,至少保证坏值有界。
+pub fn normalize_saved_state_to_logical(app: &AppHandle) {
+    // 主窗口当前显示器:scale 与逻辑尺寸上限
+    let (scale, max_w, max_h) = app
+        .get_webview_window("main")
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .map(|m| {
+            let s = m.scale_factor();
+            let sz = m.size();
+            // 逻辑上限 = 物理尺寸 / scale,向上取整避免差 1px 误杀
+            (
+                s,
+                (sz.width as f64 / s).ceil() as u64,
+                (sz.height as f64 / s).ceil() as u64,
+            )
+        })
+        .unwrap_or((1.0, HARD_MAX_W, HARD_MAX_H));
+
     if let Some(path) = state_file_path() {
-        sanitize_file(&path, max_w, max_h);
+        rewrite_entries_logical(&path, scale, max_w.min(HARD_MAX_W), max_h.min(HARD_MAX_H));
     }
+}
+
+/// 把状态文件中所有条目的 width/height 从物理像素换算为逻辑像素并钳制。
+/// 仅在插件刚写完物理值之后调用(每次保存插件都会整体重写文件,不会重复换算)。
+fn rewrite_entries_logical(path: &Path, scale: f64, max_w: u64, max_h: u64) {
+    if (scale - 1.0).abs() < f64::EPSILON && max_w == HARD_MAX_W && max_h == HARD_MAX_H {
+        // 无显示器信息且 scale=1:退化为纯清理(沿用物理上限语义)
+        sanitize_file(path, max_w, max_h);
+        return;
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => return,
+    };
+    let mut root = match serde_json::from_str::<Value>(&raw) {
+        Ok(Value::Object(map)) => map,
+        _ => return,
+    };
+    let mut changed = false;
+    for (_label, entry) in root.iter_mut() {
+        let (w, h) = match (
+            entry.get("width").and_then(|v| v.as_u64()),
+            entry.get("height").and_then(|v| v.as_u64()),
+        ) {
+            (Some(w), Some(h)) => (w, h),
+            _ => continue,
+        };
+        let (lw, lh) = to_logical_clamped(w, h, scale, max_w, max_h);
+        if lw != w || lh != h {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("width".into(), Value::from(lw));
+                obj.insert("height".into(), Value::from(lh));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let tmp = path.with_extension("json.tmp");
+        if serde_json::to_string(&Value::Object(root))
+            .map(|text| std::fs::write(&tmp, text).is_ok())
+            .unwrap_or(false)
+        {
+            let _ = std::fs::rename(&tmp, path);
+            log::info!(
+                "窗口状态已按显示器 scale={scale} 归一化为逻辑像素(上限 {max_w}x{max_h})"
+            );
+        }
+    }
+}
+
+/// 物理像素 → 逻辑像素(四舍五入到整数,插件字段是 u32),并钳制到逻辑上限。
+fn to_logical_clamped(w: u64, h: u64, scale: f64, max_w: u64, max_h: u64) -> (u64, u64) {
+    let lw = (w as f64 / scale).round() as u64;
+    let lh = (h as f64 / scale).round() as u64;
+    (lw.clamp(HARD_MIN_W, max_w), lh.clamp(HARD_MIN_H, max_h))
+}
+
+/// 窗口显示后约 1.2s(nudge 序列完成、scale 缓存已稳定)调用:
+/// 读取状态文件中本窗口的逻辑尺寸,以 LogicalSize 重新应用一次,
+/// 修正插件在窗口创建早期(缓存 scale 尚未就绪)恢复出的错误尺寸。
+/// 窗口处于最大化/全屏时跳过,避免破坏用户状态。
+pub fn reapply_saved_size(window: &WebviewWindow) {
+    let label = window.label().to_string();
+    let window = window.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        if window.is_maximized().unwrap_or(false) || window.is_fullscreen().unwrap_or(false) {
+            return;
+        }
+        let Some(path) = state_file_path() else { return };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => return,
+        };
+        let entry = match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Object(map)) => map.get(&label).cloned(),
+            _ => None,
+        };
+        let Some(entry) = entry else { return };
+        let (w, h) = match (
+            entry.get("width").and_then(|v| v.as_u64()),
+            entry.get("height").and_then(|v| v.as_u64()),
+        ) {
+            (Some(w), Some(h)) => (w, h),
+            _ => return,
+        };
+        // 状态文件保存的是逻辑像素;越界值直接放弃,保持当前尺寸
+        if w < HARD_MIN_W || h < HARD_MIN_H || w > HARD_MAX_W || h > HARD_MAX_H {
+            log::warn!("状态文件尺寸 {w}x{h} 越界,跳过重新应用");
+            return;
+        }
+        match window.set_size(tauri::LogicalSize::new(w as f64, h as f64)) {
+            Ok(()) => log::info!("已按逻辑像素 {w}x{h} 重新应用窗口尺寸"),
+            Err(e) => log::warn!("重新应用窗口尺寸失败: {e}"),
+        }
+    });
 }
 
 /// 若窗口 inner_size 超出其所在显示器的物理尺寸,立即钳制到显示器边界。
@@ -206,5 +311,53 @@ mod tests {
         );
         sanitize_file(&p, 2560, 1600);
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn to_logical_clamped_undoes_scale_growth() {
+        // 实测场景:2000x1332 物理(mutter 报 scale=1.3333333730697632)
+        // → 应精确还原为 1500x999 逻辑
+        let (w, h) = to_logical_clamped(2000, 1332, 1.333_333_373_069_763_2, 1920, 1200);
+        assert_eq!((w, h), (1500, 999));
+    }
+
+    #[test]
+    fn to_logical_clamped_rounds_and_clamps() {
+        // 1000x650 物理 @4/3 → 750x488(650/1.3333=487.5 四舍五入)
+        let (w, h) = to_logical_clamped(1000, 650, 4.0 / 3.0, 1920, 1200);
+        assert_eq!((w, h), (750, 488));
+        // 超上限钳制
+        let (w, h) = to_logical_clamped(9999, 9999, 1.0, 1920, 1200);
+        assert_eq!((w, h), (1920, 1200));
+    }
+
+    #[test]
+    fn rewrite_entries_converts_physical_to_logical() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_state(
+            dir.path(),
+            r#"{"main":{"width":2000,"height":1332,"x":0,"y":0,"maximized":false}}"#,
+        );
+        rewrite_entries_logical(&p, 1.333_333_373_069_763_2, 1920, 1200);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let root: Value = serde_json::from_str(&text).unwrap();
+        let entry = root.get("main").unwrap();
+        assert_eq!(entry.get("width").unwrap().as_u64(), Some(1500));
+        assert_eq!(entry.get("height").unwrap().as_u64(), Some(999));
+        // 其他字段不动
+        assert_eq!(entry.get("x").unwrap().as_u64(), Some(0));
+    }
+
+    #[test]
+    fn rewrite_entries_fallback_sanitize_when_no_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        // scale=1 + 默认上限 = 无显示器信息 → 纯清理语义(越界删除)
+        let p = write_state(
+            dir.path(),
+            r#"{"main":{"width":1000,"height":650,"x":0,"y":0,"maximized":false}}"#,
+        );
+        rewrite_entries_logical(&p, 1.0, HARD_MAX_W, HARD_MAX_H);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("1000"), "正常尺寸不应被改动");
     }
 }

@@ -116,6 +116,11 @@ pub(crate) fn nudge_main_window(window: WebviewWindow) {
                         log::warn!("Linux nudge: 对账回读 inner_size 失败: {e}");
                     }
                 }
+
+                // nudge 序列完成、scale 缓存已稳定后,按状态文件里的逻辑像素
+                // 重新应用窗口尺寸,修正插件在窗口创建早期恢复出的错误尺寸
+                // (window_state_guard 的不动点方案,见该模块文档)。
+                crate::window_state_guard::reapply_saved_size(&window);
             }
             Err(e) => {
                 // 极罕见的失败路径；只做了 set_focus 也比什么都不做强，
